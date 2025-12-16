@@ -1,0 +1,35 @@
+# Data (too large for git)
+data/
+*.tfrecord
+*.bin
+*.pkl
+*.npy
+
+# Model outputs
+outputs/
+checkpoints/
+*.pth
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.egg-info/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+wandb/
+tensorboard/
