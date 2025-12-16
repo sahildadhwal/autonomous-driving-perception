@@ -1,11 +1,10 @@
 """
 Waymo Open Dataset v2.0 loader for 3D object detection.
-Loads LiDAR point clouds and 3D bounding boxes from Parquet files.
+Memory-efficient version - loads frames on-demand instead of all at once.
 """
 
 import numpy as np
 import pandas as pd
-import pickle
 from pathlib import Path
 from torch.utils.data import Dataset
 import torch
@@ -18,7 +17,6 @@ class WaymoDataset(Dataset):
     CLASS_NAMES = ['Vehicle', 'Pedestrian', 'Cyclist']
     
     # Waymo type ID to class index mapping
-    # Type 1=Vehicle, 2=Pedestrian, 4=Cyclist
     TYPE_TO_CLASS = {1: 0, 2: 1, 4: 2}
     
     # Point cloud range [x_min, y_min, z_min, x_max, y_max, z_max]
@@ -33,63 +31,61 @@ class WaymoDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.augment = augment
         
-        # Find all lidar files
         self.lidar_dir = self.data_dir / 'lidar'
         self.label_dir = self.data_dir / 'lidar_box'
         
+        # Just store file paths, don't load data yet
         self.lidar_files = sorted(list(self.lidar_dir.glob('*.parquet')))
         
         print(f"Found {len(self.lidar_files)} segments")
         
-        # Load all segments into memory (small dataset, ~5GB total)
-        self.frames = []
-        self._load_all_data()
+        # Build frame index (segment_idx, timestamp) for each frame
+        self.frame_index = []
+        self._build_frame_index()
     
-    def _load_all_data(self):
-        """Load all parquet files and split into individual frames."""
-        print("Loading data into memory...")
+    def _build_frame_index(self):
+        """Build index of all frames without loading data."""
+        print("Building frame index...")
         
-        for lidar_file in self.lidar_files:
-            segment_name = lidar_file.stem
-            label_file = self.label_dir / f"{segment_name}.parquet"
+        for seg_idx, lidar_file in enumerate(self.lidar_files):
+            # Read just the timestamps column
+            lidar_df = pd.read_parquet(lidar_file, columns=['key.frame_timestamp_micros'])
+            timestamps = lidar_df['key.frame_timestamp_micros'].unique()
             
-            # Load LiDAR points
-            lidar_df = pd.read_parquet(lidar_file)
-            
-            # Load labels
-            label_df = pd.read_parquet(label_file)
-            
-            # Group by frame (timestamp)
-            frame_groups = lidar_df.groupby('key.frame_timestamp_micros')
-            
-            for timestamp, frame_points in frame_groups:
-                # Get labels for this frame
-                frame_labels = label_df[
-                    label_df['key.frame_timestamp_micros'] == timestamp
-                ]
-                
-                self.frames.append({
-                    'segment': segment_name,
-                    'timestamp': timestamp,
-                    'points': frame_points,
-                    'labels': frame_labels
+            for timestamp in timestamps:
+                self.frame_index.append({
+                    'segment_idx': seg_idx,
+                    'timestamp': timestamp
                 })
         
-        print(f"Loaded {len(self.frames)} frames total")
+        print(f"Found {len(self.frame_index)} frames total")
     
     def __len__(self):
-        return len(self.frames)
+        return len(self.frame_index)
     
     def __getitem__(self, idx):
-        frame_data = self.frames[idx]
+        frame_info = self.frame_index[idx]
+        seg_idx = frame_info['segment_idx']
+        timestamp = frame_info['timestamp']
+        
+        # Load only this frame's data
+        lidar_file = self.lidar_files[seg_idx]
+        label_file = self.label_dir / f"{lidar_file.stem}.parquet"
+        
+        # Load LiDAR points for this frame only
+        lidar_df = pd.read_parquet(lidar_file)
+        frame_points = lidar_df[lidar_df['key.frame_timestamp_micros'] == timestamp]
+        
+        # Load labels for this frame only
+        label_df = pd.read_parquet(label_file)
+        frame_labels = label_df[label_df['key.frame_timestamp_micros'] == timestamp]
         
         # Extract point cloud (x, y, z, intensity)
-        points_df = frame_data['points']
         points = np.column_stack([
-            points_df['lidar.x'].values,
-            points_df['lidar.y'].values,
-            points_df['lidar.z'].values,
-            points_df['lidar.intensity'].values
+            frame_points['lidar.x'].values,
+            frame_points['lidar.y'].values,
+            frame_points['lidar.z'].values,
+            frame_points['lidar.intensity'].values
         ]).astype(np.float32)
         
         # Filter points to range
@@ -97,15 +93,14 @@ class WaymoDataset(Dataset):
         points = points[mask]
         
         # Extract 3D bounding boxes
-        labels_df = frame_data['labels']
-        gt_boxes, gt_classes = self._extract_boxes(labels_df)
+        gt_boxes, gt_classes = self._extract_boxes(frame_labels)
         
         # Data augmentation (training only)
         if self.augment:
             points, gt_boxes = self._augment(points, gt_boxes)
         
         return {
-            'frame_id': f"{frame_data['segment']}_{frame_data['timestamp']}",
+            'frame_id': f"{lidar_file.stem}_{timestamp}",
             'points': points,
             'gt_boxes': gt_boxes,
             'gt_classes': gt_classes,
@@ -140,9 +135,9 @@ class WaymoDataset(Dataset):
                 label['lidar_box.center.x'],
                 label['lidar_box.center.y'],
                 label['lidar_box.center.z'],
-                label['lidar_box.size.x'],  # length
-                label['lidar_box.size.y'],  # width
-                label['lidar_box.size.z'],  # height
+                label['lidar_box.size.x'],
+                label['lidar_box.size.y'],
+                label['lidar_box.size.z'],
                 label['lidar_box.heading']
             ], dtype=np.float32)
             
@@ -161,9 +156,9 @@ class WaymoDataset(Dataset):
             points[:, 1] = -points[:, 1]
             if len(gt_boxes) > 0:
                 gt_boxes[:, 1] = -gt_boxes[:, 1]
-                gt_boxes[:, 6] = -gt_boxes[:, 6]  # Flip heading
+                gt_boxes[:, 6] = -gt_boxes[:, 6]
         
-        # Random rotation around Z axis (-45 to +45 degrees)
+        # Random rotation around Z axis
         rotation = np.random.uniform(-np.pi/4, np.pi/4)
         cos_r, sin_r = np.cos(rotation), np.sin(rotation)
         rotation_matrix = np.array([
@@ -176,7 +171,7 @@ class WaymoDataset(Dataset):
             gt_boxes[:, :3] = gt_boxes[:, :3] @ rotation_matrix.T
             gt_boxes[:, 6] += rotation
         
-        # Random scaling (0.95 to 1.05)
+        # Random scaling
         scale = np.random.uniform(0.95, 1.05)
         points[:, :3] *= scale
         if len(gt_boxes) > 0:
@@ -216,8 +211,6 @@ class WaymoDataset(Dataset):
             'gt_boxes': torch.from_numpy(gt_boxes),
             'gt_classes': torch.from_numpy(gt_classes),
         }
-
-
 # Test the dataset
 if __name__ == '__main__':
     # Test locally
