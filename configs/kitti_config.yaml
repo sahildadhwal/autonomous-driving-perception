@@ -1,0 +1,29 @@
+# KITTI 3D Detection Configuration
+
+DATA:
+  DATASET: KITTI
+  DATA_DIR: /content/drive/MyDrive/kitti-perception-pipeline/data
+  CLASS_NAMES: ['Car', 'Pedestrian', 'Cyclist']
+  
+  POINT_CLOUD_RANGE: [-40, -40, -3, 40, 40, 1]
+  
+  VOXEL_SIZE: [0.16, 0.16, 0.4]
+
+TRAINING:
+  BATCH_SIZE: 4
+  NUM_EPOCHS: 30
+  LEARNING_RATE: 0.001
+
+DETECTION:
+  MODEL: PointPillars
+  NMS_THRESHOLD: 0.5
+  SCORE_THRESHOLD: 0.3
+
+TRACKING:
+  METHOD: AB3DMOT
+  MAX_AGE: 3
+  MIN_HITS: 3
+
+SEGMENTATION:
+  MODEL: RangeNet
+  NUM_CLASSES: 20
